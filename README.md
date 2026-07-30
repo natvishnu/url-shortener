@@ -1,48 +1,91 @@
 # URL Shortener
 
-A simple Spring Boot service for creating, resolving, and deleting shortened URLs.
+A Spring Boot service for creating, resolving, and deleting shortened URLs, with
+optional/defaulted expiry, custom aliases, usage-based rankings, and per-code
+analytics.
+
+This implementation follows `URL_Shortener_Requirements_and_Design.docx`. It is a
+**prototype that demonstrates the design's approach at small scale** (§8 of the
+design). The production architecture is Postgres (partitioned) + Redis + a
+Snowflake-style ID service; here the `urls` and `clicks` tables live in a real SQL
+engine (**H2 in-memory**, via Spring Data JPA) so uniqueness, transactions, and
+soft-delete are enforced by the database, while the Redis sorted-set ranking layer
+is stood in for by an in-memory component (`UsageMetrics`) — Redis is in-memory in
+production too. Every component notes its production counterpart in its Javadoc.
 
 ## What it does
 
-This service exposes a small REST API that lets you:
+| Feature | Requirement | Notes |
+| --- | --- | --- |
+| Create | FR-1 | Shorten a long URL, with optional custom alias and optional expiry. |
+| Delete | FR-2 | Soft delete (`is_active=false`); analytics history is preserved. |
+| Redirect | FR-3 | `302 Found` to the long URL; `410 Gone` if expired/deleted; `404` if unknown. |
+| Expiry | FR-4, NFR-6 | User-supplied or defaulted expiry, plus inactivity-based auto-expiry; a background reaper removes expired URLs. |
+| Custom alias | FR-5 | Used verbatim as the code, subject to charset/length/reserved-word/uniqueness validation. |
+| Rankings | FR-6, NFR-5 | Low-latency "most used / least used / least recently used" served from a maintained view. |
+| Analytics | NFR-5 | Per-code click totals, last access, referrer breakdown, recent clicks. |
 
-- **Create** a shortened URL for a given long URL, optionally with a custom alias and/or a custom expiration time.
-- **Redirect** (`302 Found`) from a short code to the original long URL.
-- **Delete** (deactivate) a shortened URL so it can no longer be used for redirection.
+**Out of scope this iteration** (per the design): updating a short URL (targets are
+immutable — delete and re-create), and spam/malicious-URL detection (only basic
+input validation is performed).
 
-URLs are currently stored in an in-memory map (`ConcurrentHashMap`) inside the controller. This is a temporary storage mechanism — all data is lost when the application restarts, and it is expected to be replaced by a persistent datastore in the future.
+## Design highlights
 
-### Behavior details
+- **Uniqueness by construction (NFR-1).** Codes are base62-encoded, monotonically
+  increasing Snowflake-style IDs (`timestamp | worker-id | sequence`), not a hash of
+  the URL. Worker ids are partitioned per instance so codes never collide across
+  instances. See `id/SnowflakeCodeGenerator`.
+- **Insert-mostly `urls` row (NFR-2, NFR-4).** The stored record carries no
+  `access_count`, `last_accessed_at`, or `updated_at` — the only post-creation write
+  is `is_active` flipping to false on delete/expiry. The redirect path is a pure
+  read. See `model/UrlRecord`.
+- **Analytics off the hot path (§6.3, §6.5).** Every redirect appends one row to an
+  append-only clicks stream **asynchronously** (`@Async`), and the usage rankings are
+  maintained as two sorted-set-equivalent structures (by access count, by last
+  access) on top of that stream. The redirect returns before the click write is
+  durable. See `repository/ClickRepository` and `metrics/UsageMetrics`.
+- **Expiry + reaper (FR-4, NFR-6, §6.6).** Expiry is enforced on every redirect
+  regardless of reaper timing. A scheduled reaper deactivates URLs past their expiry
+  or their inactivity window and evicts them from the cache and rankings, guarded by
+  a safety cap that aborts a pass which would deactivate too large a fraction of
+  active URLs. See `service/ReaperService`.
+- **Self-healing rankings (§6.5).** A periodic job rebuilds the rankings from a full
+  aggregation of the clicks stream, correcting any lost async update. See
+  `service/MetricsRebuildJob`.
+- **Availability over consistency (NFR-3, §6.4).** The redirect path is cache-aside
+  with graceful DB fallback: a cache hit is a fast lookup, and if the cache is
+  unavailable the request falls back to the database rather than failing — no single
+  component is a hard dependency for a redirect. Click recording is failure-isolated
+  so analytics errors never surface to the caller. See `cache/RedirectCache` and
+  `service/UrlService`; the `redirectSurvivesCacheOutageViaDbFallback` test exercises
+  the chaos scenario from §7.
 
-- **Short code generation**: When no custom alias is given, a random 7-character Base62 code is generated. The service retries up to 10 times if a collision occurs, returning `500 Internal Server Error` if it cannot generate a unique code.
-- **Custom aliases**: If `custom_alias` is provided, it must be 3–32 characters long and contain only letters, digits, `-`, or `_`. If the alias is already in use, the request fails with `409 Conflict`.
-- **Long URL validation**: `long_url` must be a valid absolute `http://` or `https://` URL. Invalid or missing URLs return `400 Bad Request`.
-- **Expiration**:
-  - If `user_expires_at` is omitted, the URL defaults to expiring **30 days** after creation.
-  - If provided, `user_expires_at` must be an ISO-8601 instant (e.g. `2025-01-01T00:00:00Z`) that is in the future; otherwise the request returns `400 Bad Request`.
-  - Once a URL's expiration time has passed, redirect requests for it return `410 Gone`.
-- **Deletion**: Deleting a URL marks it inactive (it is not removed from the store). Subsequent redirect attempts for a deactivated code return `410 Gone`. Deleting an unknown code returns `404 Not Found`.
-- **Redirects for unknown codes** return `404 Not Found`.
+## Configuration
 
-## Building
+All settings are system-wide (no per-URL overrides), configured in
+`src/main/resources/application.properties`:
 
-This is a standard Maven project.
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `urlshortener.default-expiry-duration` | `P30D` | Expiry applied when the caller omits `user_expires_at` (FR-4). |
+| `urlshortener.inactivity-window` | `P90D` | Un-accessed URLs are auto-expired after this (NFR-6). |
+| `urlshortener.worker-id` | `1` | Snowflake worker id; must be distinct per instance. |
+| `urlshortener.reserved-aliases` | `api,admin,top,analytics,health,actuator` | Codes a custom alias may not take. |
+| `urlshortener.reaper.interval-millis` | `60000` | How often the reaper sweeps. |
+| `urlshortener.reaper.safety-cap-percent` | `20` | Max % of active URLs a single reaper pass may deactivate. |
+
+## Building and running
+
+Standard Maven project (Java 21):
 
 ```bash
-mvn clean install
+mvn clean install      # build + run tests
+mvn spring-boot:run    # start on http://localhost:8080
 ```
 
-## Running
+## API
 
-```bash
-mvn spring-boot:run
-```
-
-By default, the application starts on `http://localhost:8080`.
-
-## API Examples
-
-### Create a shortened URL
+### Create — `POST /api/urls`
 
 ```bash
 curl -i -X POST http://localhost:8080/api/urls \
@@ -50,55 +93,69 @@ curl -i -X POST http://localhost:8080/api/urls \
   -d '{"long_url": "https://example.com/some/very/long/path"}'
 ```
 
-Example response (`201 Created`):
+Body fields: `long_url` (required), `custom_alias` (optional), `user_expires_at`
+(optional ISO-8601 instant, must be in the future). Example `201 Created` response:
 
 ```json
 {
-  "code": "aB3xY9z",
+  "code": "3fB9zk2",
   "long_url": "https://example.com/some/very/long/path",
   "active": true,
-  "created_at": "2024-05-01T12:00:00Z",
-  "expires_at": "2024-05-31T12:00:00Z"
+  "created_at": "2026-07-29T12:00:00Z",
+  "expires_at": "2026-08-28T12:00:00Z"
 }
 ```
 
-#### Create with a custom alias
+- `400 Bad Request` — missing/invalid `long_url`, malformed `user_expires_at`, past
+  expiry, or an alias that violates the charset/length rules.
+- `409 Conflict` — the custom alias is already taken or is reserved.
+
+### Redirect — `GET /{code}`
 
 ```bash
-curl -i -X POST http://localhost:8080/api/urls \
-  -H "Content-Type: application/json" \
-  -d '{"long_url": "https://example.com/some/path", "custom_alias": "my-link"}'
+curl -i http://localhost:8080/3fB9zk2
 ```
 
-#### Create with a custom expiration
+`302 Found` with a `Location` header; `404` if unknown; `410 Gone` if deleted or
+expired. Each redirect asynchronously records a click.
+
+### Delete — `DELETE /api/urls/{code}`
 
 ```bash
-curl -i -X POST http://localhost:8080/api/urls \
-  -H "Content-Type: application/json" \
-  -d '{"long_url": "https://example.com/some/path", "user_expires_at": "2025-01-01T00:00:00Z"}'
+curl -i -X DELETE http://localhost:8080/api/urls/3fB9zk2
 ```
 
-### Follow a short URL (redirect)
+`204 No Content` on success (soft delete); `404` if the code is unknown.
+
+### Rankings — `GET /api/urls/top?by=most_used|least_used|lru&limit=N`
 
 ```bash
-curl -i http://localhost:8080/aB3xY9z
+curl -s "http://localhost:8080/api/urls/top?by=most_used&limit=10"
 ```
 
-Example response:
+`by` accepts `most_used` (a.k.a. `frequently_used`), `least_used`, or `lru`
+(a.k.a. `least_recently_used`). Returns entries with `code`, `access_count`, and
+`last_accessed_at`.
 
-```
-HTTP/1.1 302 Found
-Location: https://example.com/some/very/long/path
-```
-
-If the code doesn't exist, this returns `404 Not Found`. If it has been deleted or has expired, this returns `410 Gone`.
-
-### Delete a shortened URL
+### Analytics — `GET /api/urls/{code}/analytics`
 
 ```bash
-curl -i -X DELETE http://localhost:8080/api/urls/aB3xY9z
+curl -s http://localhost:8080/api/urls/3fB9zk2/analytics
 ```
 
-Example response: `204 No Content`.
+Returns the code's `active`/`created_at`/`expires_at`, `total_clicks`,
+`last_accessed_at`, a `referrers` breakdown, and the most recent click timestamps.
 
-Deleting a code that doesn't exist returns `404 Not Found`.
+## Note on persistence
+
+The `urls` and `clicks` tables are persisted to an **H2 in-memory database** through
+Spring Data JPA; schema is auto-created on startup (`ddl-auto=create-drop`) and all
+data resets when the app stops. A browsable console is available in development at
+`http://localhost:8080/h2-console` (JDBC URL `jdbc:h2:mem:urlshortener`, user `sa`,
+empty password).
+
+Mapping to production per the design: `UrlRepository` → partitioned Postgres + Redis
+cache-aside; `ClickRepository` → time-partitioned append-only clicks table;
+`UsageMetrics` → Redis sorted sets; `SnowflakeCodeGenerator` → a distributed ID
+service. Swapping H2 for Postgres is a dependency + datasource-URL change; the JPA
+entities and repositories are unchanged.
