@@ -64,6 +64,19 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+          springdoc-openapi: generates the OpenAPI 3 spec from the controllers and
+          serves the Swagger UI. 2.6.0 is the line aligned with Spring Boot 3.3
+          (Spring Framework 6.1); 2.7+/2.8.x require Boot 3.4+ (Spring 6.2) and fail
+          at startup here with NoClassDefFoundError on LiteWebJarsResourceResolver.
+          https://mvnrepository.com/artifact/org.springdoc/springdoc-openapi-starter-webmvc-ui
+        -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.6.0</version>
+        </dependency>
+
     </dependencies>
 
     <build>
